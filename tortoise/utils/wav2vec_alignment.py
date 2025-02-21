@@ -50,7 +50,7 @@ class Wav2VecAlignment:
     Uses wav2vec2 to perform audio<->text alignment.
     """
     def __init__(self, device='cuda' if not torch.backends.mps.is_available() else 'mps'):
-        self.model = Wav2Vec2ForCTC.from_pretrained("jbetker/wav2vec2-large-robust-ft-libritts-voxpopuli").cpu()
+        self.model = Wav2Vec2ForCTC.from_pretrained("jbetker/wav2vec2-large-robust-ft-libritts-voxpopuli")
         self.feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(f"facebook/wav2vec2-large-960h")
         self.tokenizer = Wav2Vec2CTCTokenizer.from_pretrained('jbetker/tacotron-symbols')
         self.device = device
@@ -59,12 +59,14 @@ class Wav2VecAlignment:
         orig_len = audio.shape[-1]
 
         with torch.no_grad():
-            self.model = self.model.to(self.device)
-            audio = audio.to(self.device)
+            if self.device == 'cuda':
+                self.model = self.model.cuda()
+                audio = audio.cuda()
             audio = torchaudio.functional.resample(audio, audio_sample_rate, 16000)
             clip_norm = (audio - audio.mean()) / torch.sqrt(audio.var() + 1e-7)
             logits = self.model(clip_norm).logits
-            self.model = self.model.cpu()
+            if self.device == 'cuda':
+                self.model = self.model.cpu()
 
         logits = logits[0]
         pred_string = self.tokenizer.decode(logits.argmax(-1).tolist())
