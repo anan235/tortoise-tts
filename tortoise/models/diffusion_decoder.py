@@ -5,7 +5,6 @@ from abc import abstractmethod
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import autocast
 
 from tortoise.models.arch_util import normalization, AttentionBlock
 
@@ -96,7 +95,7 @@ class ResBlock(TimestepBlock):
             normalization(self.out_channels),
             nn.SiLU(),
             nn.Dropout(p=dropout),
-                nn.Conv1d(self.out_channels, self.out_channels, kernel_size, padding=padding),
+            nn.Conv1d(self.out_channels, self.out_channels, kernel_size, padding=padding),
         )
 
         if self.out_channels == channels:
@@ -165,10 +164,6 @@ class DiffusionTts(nn.Module):
             nn.Linear(model_channels, model_channels),
         )
 
-        # Either code_converter or latent_converter is used, depending on what type of conditioning data is fed.
-        # This model is meant to be able to be trained on both for efficiency purposes - it is far less computationally
-        # complex to generate tokens, while generating latents will normally mean propagating through a deep autoregressive
-        # transformer network.
         self.code_embedding = nn.Embedding(in_tokens, model_channels)
         self.code_converter = nn.Sequential(
             AttentionBlock(model_channels, num_heads, relative_pos_embeddings=True),
@@ -183,14 +178,16 @@ class DiffusionTts(nn.Module):
             AttentionBlock(model_channels, num_heads, relative_pos_embeddings=True),
             AttentionBlock(model_channels, num_heads, relative_pos_embeddings=True),
         )
-        self.contextual_embedder = nn.Sequential(nn.Conv1d(in_channels,model_channels,3,padding=1,stride=2),
-                                                 nn.Conv1d(model_channels, model_channels*2,3,padding=1,stride=2),
-                                                 AttentionBlock(model_channels*2, num_heads, relative_pos_embeddings=True, do_checkpoint=False),
-                                                 AttentionBlock(model_channels*2, num_heads, relative_pos_embeddings=True, do_checkpoint=False),
-                                                 AttentionBlock(model_channels*2, num_heads, relative_pos_embeddings=True, do_checkpoint=False),
-                                                 AttentionBlock(model_channels*2, num_heads, relative_pos_embeddings=True, do_checkpoint=False),
-                                                 AttentionBlock(model_channels*2, num_heads, relative_pos_embeddings=True, do_checkpoint=False))
-        self.unconditioned_embedding = nn.Parameter(torch.randn(1,model_channels,1))
+        self.contextual_embedder = nn.Sequential(
+            nn.Conv1d(in_channels, model_channels, 3, padding=1, stride=2),
+            nn.Conv1d(model_channels, model_channels*2, 3, padding=1, stride=2),
+            AttentionBlock(model_channels*2, num_heads, relative_pos_embeddings=True, do_checkpoint=False),
+            AttentionBlock(model_channels*2, num_heads, relative_pos_embeddings=True, do_checkpoint=False),
+            AttentionBlock(model_channels*2, num_heads, relative_pos_embeddings=True, do_checkpoint=False),
+            AttentionBlock(model_channels*2, num_heads, relative_pos_embeddings=True, do_checkpoint=False),
+            AttentionBlock(model_channels*2, num_heads, relative_pos_embeddings=True, do_checkpoint=False)
+        )
+        self.unconditioned_embedding = nn.Parameter(torch.randn(1, model_channels, 1))
         self.conditioning_timestep_integrator = TimestepEmbedSequential(
             DiffusionLayer(model_channels, dropout, num_heads),
             DiffusionLayer(model_channels, dropout, num_heads),
@@ -200,8 +197,10 @@ class DiffusionTts(nn.Module):
         self.integrating_conv = nn.Conv1d(model_channels*2, model_channels, kernel_size=1)
         self.mel_head = nn.Conv1d(model_channels, in_channels, kernel_size=3, padding=1)
 
-        self.layers = nn.ModuleList([DiffusionLayer(model_channels, dropout, num_heads) for _ in range(num_layers)] +
-                                    [ResBlock(model_channels, model_channels, dropout, dims=1, use_scale_shift_norm=True) for _ in range(3)])
+        self.layers = nn.ModuleList(
+            [DiffusionLayer(model_channels, dropout, num_heads) for _ in range(num_layers)] +
+            [ResBlock(model_channels, model_channels, dropout, dims=1, use_scale_shift_norm=True) for _ in range(3)]
+        )
 
         self.out = nn.Sequential(
             normalization(model_channels),
@@ -243,36 +242,23 @@ class DiffusionTts(nn.Module):
         code_emb = self.code_norm(code_emb) * (1 + cond_scale.unsqueeze(-1)) + cond_shift.unsqueeze(-1)
 
         unconditioned_batches = torch.zeros((code_emb.shape[0], 1, 1), device=code_emb.device)
-        # Mask out the conditioning branch for whole batch elements, implementing something similar to classifier-free guidance.
         if self.training and self.unconditioned_percentage > 0:
             unconditioned_batches = torch.rand((code_emb.shape[0], 1, 1),
-                                               device=code_emb.device) < self.unconditioned_percentage
+                                             device=code_emb.device) < self.unconditioned_percentage
             code_emb = torch.where(unconditioned_batches, self.unconditioned_embedding.repeat(aligned_conditioning.shape[0], 1, 1),
-                                   code_emb)
+                                 code_emb)
         expanded_code_emb = F.interpolate(code_emb, size=expected_seq_len, mode='nearest')
 
         if not return_code_pred:
             return expanded_code_emb
         else:
             mel_pred = self.mel_head(expanded_code_emb)
-            # Multiply mel_pred by !unconditioned_branches, which drops the gradient on unconditioned branches. This is because we don't want that gradient being used to train parameters through the codes_embedder as it unbalances contributions to that network from the MSE loss.
             mel_pred = mel_pred * unconditioned_batches.logical_not()
             return expanded_code_emb, mel_pred
 
     def forward(self, x, timesteps, aligned_conditioning=None, conditioning_latent=None, precomputed_aligned_embeddings=None, conditioning_free=False, return_code_pred=False):
-        """
-        Apply the model to an input batch.
-
-        :param x: an [N x C x ...] Tensor of inputs.
-        :param timesteps: a 1-D batch of timesteps.
-        :param aligned_conditioning: an aligned latent or sequence of tokens providing useful data about the sample to be produced.
-        :param conditioning_latent: a pre-computed conditioning latent; see get_conditioning().
-        :param precomputed_aligned_embeddings: Embeddings returned from self.timestep_independent()
-        :param conditioning_free: When set, all conditioning inputs (including tokens and conditioning_input) will not be considered.
-        :return: an [N x C x ...] Tensor of outputs.
-        """
         assert precomputed_aligned_embeddings is not None or (aligned_conditioning is not None and conditioning_latent is not None)
-        assert not (return_code_pred and precomputed_aligned_embeddings is not None)  # These two are mutually exclusive.
+        assert not (return_code_pred and precomputed_aligned_embeddings is not None)
 
         unused_params = []
         if conditioning_free:
@@ -296,22 +282,16 @@ class DiffusionTts(nn.Module):
         x = self.inp_block(x)
         x = torch.cat([x, code_emb], dim=1)
         x = self.integrating_conv(x)
+        
         for i, lyr in enumerate(self.layers):
-            # Do layer drop where applicable. Do not drop first and last layers.
             if self.training and self.layer_drop > 0 and i != 0 and i != (len(self.layers)-1) and random.random() < self.layer_drop:
                 unused_params.extend(list(lyr.parameters()))
             else:
-                # First and last blocks will have autocast disabled for improved precision.
-                if not torch.backends.mps.is_available():
-                    with autocast(x.device.type, enabled=self.enable_fp16 and i != 0):
-                        x = lyr(x, time_emb)
-                else:
-                    x = lyr(x, time_emb)
+                x = lyr(x, time_emb)
 
         x = x.float()
         out = self.out(x)
 
-        # Involve probabilistic or possibly unused parameters in loss so we don't get DDP errors.
         extraneous_addition = 0
         for p in unused_params:
             extraneous_addition = extraneous_addition + p.mean()
@@ -324,8 +304,8 @@ class DiffusionTts(nn.Module):
 
 if __name__ == '__main__':
     clip = torch.randn(2, 100, 400)
-    aligned_latent = torch.randn(2,388,512)
-    aligned_sequence = torch.randint(0,8192,(2,100))
+    aligned_latent = torch.randn(2, 388, 512)
+    aligned_sequence = torch.randint(0, 8192, (2, 100))
     cond = torch.randn(2, 100, 400)
     ts = torch.LongTensor([600, 600])
     model = DiffusionTts(512, layer_drop=.3, unconditioned_percentage=.5)
@@ -333,4 +313,3 @@ if __name__ == '__main__':
     #o = model(clip, ts, aligned_latent, cond)
     # Test with sequence aligned conditioning
     o = model(clip, ts, aligned_sequence, cond)
-
